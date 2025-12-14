@@ -11,20 +11,21 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+
 import modelopt.torch.quantization as mtq
 from modelopt.torch.export import import_mcore_gpt_from_hf
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
@@ -157,7 +158,7 @@ if __name__ == "__main__":
     args = get_args()
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
 
     report_current_memory_info()
 
@@ -166,9 +167,16 @@ if __name__ == "__main__":
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
+        from modelopt.torch.export import import_mcore_gpt_from_hf
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_mcore_gpt_from_hf(unwrapped_model, args.pretrained_model_path, workspace_dir)
+        import_mcore_gpt_from_hf(
+            unwrapped_model,
+            args.pretrained_model_path,
+            workspace_dir,
+            dtype=import_dtype,
+        )
 
     def _custom_prompt_forward_loop_func(model):
         all_prompts = args.prompts.split("|")
@@ -237,4 +245,4 @@ if __name__ == "__main__":
     _custom_prompt_forward_loop_func(unwrapped_model)
 
     if args.save is not None and args.export_quant_cfg in QUANT_CFG_CHOICES:
-        save_checkpoint(1, model, None, None, 0)
+        save_checkpoint(1, model, None, None, 0, release=True)

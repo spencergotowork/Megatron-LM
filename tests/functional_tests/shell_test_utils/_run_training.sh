@@ -8,7 +8,7 @@
 
 set -euxo pipefail
 
-echo "------ARGUMENTS LIST --------"
+set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -18,7 +18,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
@@ -39,9 +39,11 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set +x
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
+set -x
 
 # Pull env vars to export
 ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
@@ -135,10 +137,12 @@ else
     TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
     # Split into array while preserving quotes
     eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
-    PARAMS=(
-        "--exit-duration-in-mins"
-        $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
-    )
+    if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        PARAMS=(
+            "--exit-duration-in-mins"
+            $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+        )
+    fi
 fi
 
 # Extract training params
@@ -152,9 +156,9 @@ export WANDB_API_KEY="${WANDB_API_KEY:-}"
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
 LAST_RANK=7
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
@@ -164,22 +168,19 @@ DISTRIBUTED_ARGS=(
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
-    --node_rank $SLURM_NODEID
+    --node_rank $NODE_RANK
     --log-dir $LOG_DIR
     --tee "0:3,7:3"
     --redirects "3"
 )
 
-sleep 5
-set -x
-fuser -k /dev/nvidia* || true
-nvidia-smi pmon -c 1
-
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
+        $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 
 # Run after script

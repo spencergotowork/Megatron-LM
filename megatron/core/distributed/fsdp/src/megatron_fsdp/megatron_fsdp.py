@@ -224,7 +224,7 @@ class MegatronFSDP(torch.nn.Module):
         # step of the model will reduce all gradients and gather all parameters
         # for synchronized operations such as distributed optimization and
         # distributed checkpointing particularly sharding with HSDP / DP-Outer.
-        self.model_auto_sync = self.set_model_auto_sync(sync_model_each_microbatch)
+        self.set_model_auto_sync(sync_model_each_microbatch)
 
         # Check if the module contains (Megatron-Core) expert parallel parameters or DTensors.
         has_expert_parameters = self._check_module_parameter_types()
@@ -235,7 +235,10 @@ class MegatronFSDP(torch.nn.Module):
         self.dist_index = dist_index
 
         # If Megatron Expert Parallelism is enabled, you need to provide an expt_dp_group.
-        if has_expert_parameters and self.dist_index.get_expert_dp_group() is None:
+        if (
+            has_expert_parameters
+            and self.dist_index.get_fsdp_group(is_expert_parallel=True) is None
+        ):
             raise ValueError(
                 "[Megatron-FSDP] Megatron Expert Parallelism is enabled, but no expt_dp_group is"
                 "provided."
@@ -307,8 +310,11 @@ class MegatronFSDP(torch.nn.Module):
             expert_gradient_scaling_factor = None
         else:
             if self.ddp_config.average_in_collective:
-                # FIXME(@jianbinc): Will fix this issue based on Parallel Folding's EDP patch MR.
-                raise Exception("Not supported")
+                gradient_scaling_factor = 1.0
+                expert_gradient_scaling_factor = (
+                    self.dist_index.get_dp_group(is_expert_parallel=True).size()
+                    / self.dist_index.get_dp_group().size()
+                )
             else:
                 data_parallel_world_size = self.dist_index.get_dp_group().size()
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
@@ -350,9 +356,7 @@ class MegatronFSDP(torch.nn.Module):
         )
 
         # Set the suggested communication unit size for reduce-scatter and all-gather pipelines.
-        suggested_communication_unit_size = (
-            self.ddp_config.suggested_communication_unit_size or 1_000_000_000
-        )
+        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
         if suggested_communication_unit_size is None:
             if self.data_parallel_sharding_strategy == "optim_grads_params":
                 total_param_elements = 0
@@ -367,6 +371,8 @@ class MegatronFSDP(torch.nn.Module):
                 suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
             elif self.bucket_size is not None:
                 suggested_communication_unit_size = self.bucket_size
+            else:
+                suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
             suggested_communication_unit_size = max(
@@ -425,6 +431,19 @@ class MegatronFSDP(torch.nn.Module):
             for param in params:
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 ag_pipeline.wait_bucket_ready(bucket_id)
+
+        for param in params:
+            # This setting is needed to make FSDP store the weight object when used
+            # with TE's activation offloading for the first global batch.
+            param.grad_added_to_main_grad = False
+            # This setting is needed to have this attribute present after every
+            # un-shard of the FSDP params.
+            param.__fsdp_param__ = True
+            # Transformer Engine accumulates gradient on top of the `main_grad`
+            # buffer when gradient accumulation fusion in enabled. But with FSDP,
+            # we want to overwrite the `main_grad` which is enabled by this
+            # attribute.
+            param.overwrite_main_grad = True
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -879,9 +898,10 @@ class MegatronFSDP(torch.nn.Module):
 
         # Register pre state_dict hook to ensure that the module parameters are
         # distributed before saving the state_dict.
-        self._state_dict_pre_hook = self.module.register_state_dict_pre_hook(
-            lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
-        )
+        for name, module in self.named_modules():
+            module.register_state_dict_pre_hook(
+                lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
+            )
 
     @contextmanager
     def no_sync(self):

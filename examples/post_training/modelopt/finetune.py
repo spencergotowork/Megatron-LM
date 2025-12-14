@@ -2,12 +2,12 @@
 
 """Supervised Finetuning GPT."""
 import itertools
+import json
 import os
 import sys
 from functools import partial
 from typing import Any, Dict, Optional
 
-import json
 import jsonlines
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -20,16 +20,16 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.loss_func import loss_func
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import (
-    average_losses_across_data_parallel_group,
     get_batch_on_this_cp_rank,
     get_ltor_masks_and_position_ids,
     print_rank_0,
-    unwrap_model,
 )
+from model_provider import model_provider
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -47,7 +47,7 @@ def add_finetune_args(parser):
 
 def get_eos_id():
     """Return the eos token id.
-    
+
     We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
     we need to replace it with some other special tokens that do not appear in message."""
     tokenizer = get_tokenizer()
@@ -78,7 +78,7 @@ class OfflineDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.num_samples
-    
+
     def __getitem__(self, idx):
         idx = idx % len(self.file_paths)
         file_path = self.file_paths[idx]
@@ -167,7 +167,7 @@ class SFTDataset(torch.utils.data.Dataset):
             hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
                 self.hf_dataset, {"split": "train"}
             )
-            self._raw_samples = datasets.load_dataset(self.hf_dataset, **hf_dataset_kwargs)
+            self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
             self._raw_samples = self._raw_samples.shard(
                 num_shards=self.num_shards, index=shard_index
             )
@@ -386,7 +386,7 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
 
 def get_batch(data_iterator):
     """Generate a batch.
-    
+
     For OfflineDataset, the aux_hidden_states and final hidden_states from the
     base model are loaded for offline speculative model training."""
     # TODO: this is pretty hacky, find a better way
@@ -451,72 +451,14 @@ def get_batch(data_iterator):
     return batch
 
 
-def _mask_loss(output_tensor, loss_mask, mp_reduce=False):
-    """Apply mask to the unreduced loss tensor."""
-    args = get_args()
-
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-
-    if args.context_parallel_size > 1:
-        loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), loss_mask.sum().view(1)])
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-        loss = loss[0] / loss[1]
-    else:
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-    if mp_reduce and args.tensor_model_parallel_size > 1:
-        # KD loss requires extra all-reduce to ensure same values across MP-TP partitions.
-        loss = torch.sum(tensor_parallel.gather_from_tensor_model_parallel_region(loss.reshape(1)))
-
-    return loss
-
-
-def _allreduce_loss(loss):
-    """Reduce loss for reporting purposes."""
-    args = get_args()
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss.isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-        )
-
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
-
-    return loss * args.context_parallel_size, averaged_loss[0]
-
-
-def loss_func(loss_mask: torch.Tensor, model: GPTModel, output_tensor: torch.Tensor):
-    """Loss function (with KD Loss support).
-
-    Args:
-        loss_mask (Tensor): Used to mask out some portions of the loss
-        model (GPTModel): The model (can be wrapped)
-        output_tensor (Tensor): The tensor with the losses
-    """
-    args = get_args()
-
-    # Unwrap for both Distillation and LANA
-    model = unwrap_model(model)
-
-    # Standard lm loss
-    output_tensor = output_tensor.float()  # cache
-    loss_lm = _mask_loss(output_tensor, loss_mask)
-    loss_lm, loss_lm_avg = _allreduce_loss(loss_lm)
-    loss, report = loss_lm, {'lm loss': loss_lm_avg}
-
-    return loss, report
-
-
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
     if not args.export_offline_model:
-        report_draft_acceptance_length(model)
+        try:
+            report_draft_acceptance_length(model)
+        except Exception as e:
+            print(e)
 
 
 
@@ -549,13 +491,13 @@ def forward_step(data_iterator, model: GPTModel):
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask, model)
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 if __name__ == "__main__":
     pretrain(
         train_valid_test_sft_datasets_provider,
-        model_provider,
+        partial(model_provider, modelopt_gpt_mamba_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         extra_args_provider=add_finetune_args,
